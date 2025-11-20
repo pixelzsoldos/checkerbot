@@ -1,0 +1,11 @@
+services:
+  bot:
+    build:
+      context: /mnt/ssd/apps/checkerbot
+    env_file:
+      - /mnt/ssd/apps/checkerbot/.env
+    restart: unless-stopped
+    tty: false
+    working_dir: /app
+    volumes:
+      - /mnt/ssd/apps/checkerbot:/app:ro
