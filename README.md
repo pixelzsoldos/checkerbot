@@ -50,6 +50,9 @@ The bot automatically loads this file on startup via `python-dotenv`.
 - `/check example.com` – HTTP reachability test from Hungarian proxies (with direct fallback).
 - `/shot example.com` – loads the page with Chromium on the Pi, takes a screenshot and sends it back. Alias: `/screenshot`.
 - `/lang hu` or `/lang en` – sets the language for the current chat (Hungarian or English).
+- `/watch example.com 60` – periodically checks reachability every 60 minutes (default: 60). You are notified only when the status changes.
+- `/unwatch example.com` – stops the periodic watch for the given domain in the current chat.
+- `/debug example.com` – runs a detailed diagnostic, listing HTTP status, attempts and recent proxy errors.
 
 ## Docker (optional)
 You can build a container with the provided `Dockerfile` so the bot can run continuously in the background.

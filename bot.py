@@ -153,6 +153,58 @@ MESSAGES = {
         "hu": "Egyik vizsgált proxy sem tudta elérni a webhelyet.",
         "en": "None of the tested proxies could reach the site.",
     },
+    "watch_usage": {
+        "hu": "Használat: /watch <domain vagy URL> [perc]\nAlapértelmezett időköz: 60 perc.",
+        "en": "Usage: /watch <domain or URL> [minutes]\nDefault interval: 60 minutes.",
+    },
+    "watch_started": {
+        "hu": "Figyelés elindítva: {host} (időköz: {minutes} perc). Állapotváltozáskor értesítelek.",
+        "en": "Started watching {host} (interval: {minutes} minutes). You will be notified on status changes.",
+    },
+    "watch_updated": {
+        "hu": "A(z) {host} figyelési időköze frissítve: {minutes} perc.",
+        "en": "Updated watch interval for {host} to {minutes} minutes.",
+    },
+    "watch_invalid_interval": {
+        "hu": "Érvénytelen időköz. Adj meg egy számot percekben (5–1440).",
+        "en": "Invalid interval. Please provide a number in minutes (5–1440).",
+    },
+    "unwatch_usage": {
+        "hu": "Használat: /unwatch <domain vagy URL>",
+        "en": "Usage: /unwatch <domain or URL>",
+    },
+    "unwatch_ok": {
+        "hu": "A(z) {host} figyelését leállítottam.",
+        "en": "Stopped watching {host}.",
+    },
+    "unwatch_not_found": {
+        "hu": "Nem figyelem a(z) {host} címet.",
+        "en": "This bot is not watching {host}.",
+    },
+    "watch_status_changed_ok": {
+        "hu": "🔔 Állapotváltozás: {host} most ELÉRHETŐ magyarországról. (HTTP {status}, proxy: {proxy})",
+        "en": "🔔 Status changed: {host} is now REACHABLE from Hungary. (HTTP {status}, proxy: {proxy})",
+    },
+    "watch_status_changed_fail": {
+        "hu": "🔔 Állapotváltozás: {host} már NEM elérhető magyarországról.\nOk: {reason}",
+        "en": "🔔 Status changed: {host} is NO LONGER reachable from Hungary.\nReason: {reason}",
+    },
+    "debug_usage": {
+        "hu": "Használat: /debug <domain vagy URL>",
+        "en": "Usage: /debug <domain or URL>",
+    },
+    "debug_header_ok": {
+        "hu": "Részletes diagnosztika (sikeres elérés) – {host}",
+        "en": "Detailed diagnostics (reachable) – {host}",
+    },
+    "debug_header_fail": {
+        "hu": "Részletes diagnosztika (SIKERTELEN) – {host}",
+        "en": "Detailed diagnostics (FAILED) – {host}",
+    },
+    "debug_no_errors": {
+        "hu": "Nincs elérhető részletes hibalista.",
+        "en": "No detailed error list is available.",
+    },
 }
 
 
@@ -494,6 +546,220 @@ async def lang_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(t("lang_set", requested))
 
 
+async def watch_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Időzített ellenőrzés: csak állapotváltozáskor küld értesítést."""
+    job = context.job
+    if job is None or job.data is None:
+        return
+
+    data = job.data
+    chat_id = data.get("chat_id")
+    hostname = data.get("hostname")
+    url = data.get("url")
+
+    if chat_id is None or not hostname or not url:
+        return
+
+    store = getattr(context.application, "watch_store", None)
+    if not isinstance(store, dict):
+        return
+
+    key = (chat_id, hostname)
+    entry = store.get(key)
+    if not entry or entry.get("job") is not job:
+        # A figyelést már leállították.
+        return
+
+    lang = get_chat_lang(context, chat_id)
+
+    result = await asyncio.to_thread(checker.check, url)
+
+    last_reachable = entry.get("last_reachable")
+    if last_reachable is not None and last_reachable == result.reachable:
+        # Nincs állapotváltozás, nem küldünk üzenetet.
+        return
+
+    entry["last_reachable"] = result.reachable
+
+    if result.reachable:
+        proxy_label = result.proxy_ip or ("ismeretlen" if lang == "hu" else "unknown")
+        text = t(
+            "watch_status_changed_ok",
+            lang,
+            host=hostname,
+            status=result.status_code or "n/a",
+            proxy=proxy_label,
+        )
+    else:
+        reason_key = result.message
+        reason = t(reason_key, lang) if reason_key in MESSAGES else reason_key
+        text = t("watch_status_changed_fail", lang, host=hostname, reason=reason)
+
+    await context.bot.send_message(chat_id=chat_id, text=text)
+
+
+async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    lang = get_chat_lang(context, chat_id)
+
+    if not context.args:
+        await update.message.reply_text(t("watch_usage", lang))
+        return
+
+    try:
+        url, hostname = normalize_target(context.args[0])
+    except UserError as exc:
+        await update.message.reply_text(t(exc.key, lang))
+        return
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+
+    interval_min = 60
+    if len(context.args) >= 2:
+        try:
+            interval_min = int(context.args[1])
+        except ValueError:
+            await update.message.reply_text(t("watch_invalid_interval", lang))
+            return
+
+    if interval_min < 5 or interval_min > 1440:
+        await update.message.reply_text(t("watch_invalid_interval", lang))
+        return
+
+    if chat_id is None:
+        return
+
+    if not hasattr(context.application, "watch_store") or not isinstance(
+        context.application.watch_store, dict
+    ):
+        context.application.watch_store = {}
+
+    key = (chat_id, hostname)
+    existing = context.application.watch_store.get(key)
+    if existing and existing.get("job") is not None:
+        existing["job"].schedule_removal()
+
+    job = context.job_queue.run_repeating(
+        watch_job,
+        interval=interval_min * 60,
+        first=interval_min * 60,
+        data={"chat_id": chat_id, "hostname": hostname, "url": url},
+    )
+
+    context.application.watch_store[key] = {
+        "job": job,
+        "interval_min": interval_min,
+        "last_reachable": None,
+    }
+
+    if existing:
+        msg = t("watch_updated", lang, host=hostname, minutes=interval_min)
+    else:
+        msg = t("watch_started", lang, host=hostname, minutes=interval_min)
+
+    await update.message.reply_text(msg)
+
+
+async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    lang = get_chat_lang(context, chat_id)
+
+    if not context.args:
+        await update.message.reply_text(t("unwatch_usage", lang))
+        return
+
+    try:
+        _url, hostname = normalize_target(context.args[0])
+    except UserError as exc:
+        await update.message.reply_text(t(exc.key, lang))
+        return
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+
+    if chat_id is None:
+        return
+
+    store = getattr(context.application, "watch_store", None)
+    if not isinstance(store, dict):
+        await update.message.reply_text(t("unwatch_not_found", lang, host=hostname))
+        return
+
+    key = (chat_id, hostname)
+    entry = store.get(key)
+    if not entry:
+        await update.message.reply_text(t("unwatch_not_found", lang, host=hostname))
+        return
+
+    job = entry.get("job")
+    if job is not None:
+        job.schedule_removal()
+
+    del store[key]
+
+    await update.message.reply_text(t("unwatch_ok", lang, host=hostname))
+
+
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    lang = get_chat_lang(context, chat_id)
+
+    if not context.args:
+        await update.message.reply_text(t("debug_usage", lang))
+        return
+
+    try:
+        url, hostname = normalize_target(context.args[0])
+    except UserError as exc:
+        await update.message.reply_text(t(exc.key, lang))
+        return
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return
+
+    result = await asyncio.to_thread(checker.check, url)
+
+    if result.reachable:
+        header = t("debug_header_ok", lang, host=hostname)
+    else:
+        header = t("debug_header_fail", lang, host=hostname)
+
+    lines: List[str] = [
+        header,
+        "",
+        f"Reachable: {result.reachable}",
+        f"HTTP: {result.status_code or 'n/a'}",
+        f"Attempts: {result.attempts}",
+    ]
+
+    if result.proxy_ip:
+        lines.append(f"Proxy: {result.proxy_ip}")
+
+    if result.errors:
+        lines.append("")
+        lines.append("Errors:")
+        for err in result.errors:
+            lines.append(f"- {err}")
+    else:
+        lines.append("")
+        lines.append(t("debug_no_errors", lang))
+
+    await update.message.reply_text("\n".join(lines))
+
+
 def build_application(token: str) -> Application:
     return Application.builder().token(token).build()
 
@@ -509,6 +775,9 @@ def main() -> None:
     application.add_handler(CommandHandler("check", check_command))
     application.add_handler(CommandHandler(["shot", "screenshot"], screenshot_command))
     application.add_handler(CommandHandler("lang", lang_command))
+    application.add_handler(CommandHandler("watch", watch_command))
+    application.add_handler(CommandHandler("unwatch", unwatch_command))
+    application.add_handler(CommandHandler("debug", debug_command))
 
     logger.info("Bot indul...")
     application.run_polling()
